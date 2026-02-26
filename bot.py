@@ -2,6 +2,8 @@ import os
 import re
 import json
 import time
+from datetime import datetime, date
+from zoneinfo import ZoneInfo
 from io import BytesIO
 from urllib.parse import urljoin
 
@@ -172,15 +174,90 @@ def _start_hour_from_time_line(line: str) -> int | None:
         return None
     return int(m.group(1))
 
+RU_MONTHS = {
+    "января": 1,
+    "февраля": 2,
+    "марта": 3,
+    "апреля": 4,
+    "мая": 5,
+    "июня": 6,
+    "июля": 7,
+    "августа": 8,
+    "сентября": 9,
+    "октября": 10,
+    "ноября": 11,
+    "декабря": 12,
+}
+
+def _today_warsaw() -> date:
+    return datetime.now(ZoneInfo("Europe/Warsaw")).date()
+
+def _parse_ru_day_month(s: str) -> tuple[int, int] | None:
+    """
+    '16 февраля' -> (16, 2)
+    """
+    s = _norm(s).lower()
+    m = re.match(r"^\s*(\d{1,2})\s+([а-яё]+)\s*$", s)
+    if not m:
+        return None
+    day = int(m.group(1))
+    mon_word = m.group(2)
+    month = RU_MONTHS.get(mon_word)
+    if not month:
+        return None
+    return day, month
+
+def _date_from_day_key(day_key: str, today: date) -> date | None:
+    """
+    day_key: 'Понедельник – 16 февраля'
+    Возвращает реальную дату (с годом), выбирая ближайший год к today из [today.year-1, today.year, today.year+1].
+    """
+    # берём часть после тире
+    if "–" in day_key:
+        date_part = day_key.split("–", 1)[1].strip()
+    elif "-" in day_key:
+        date_part = day_key.split("-", 1)[1].strip()
+    else:
+        return None
+
+    dm = _parse_ru_day_month(date_part)
+    if not dm:
+        return None
+    d, mth = dm
+
+    candidates = []
+    for y in (today.year - 1, today.year, today.year + 1):
+        try:
+            candidates.append(date(y, mth, d))
+        except ValueError:
+            continue
+
+    if not candidates:
+        return None
+
+    # выбираем кандидата с минимальной дистанцией до today
+    best = min(candidates, key=lambda dt: abs((dt - today).days))
+    return best
+
+def filter_out_past_days(free_swim: dict) -> dict:
+    """
+    Убирает прошедшие даты (строго меньше сегодняшнего дня по Europe/Warsaw).
+    """
+    today = _today_warsaw()
+    out = {}
+    for day_key, times in free_swim.items():
+        dt = _date_from_day_key(day_key, today=today)
+        # если не распарсили дату — оставим, чтобы ничего не потерять
+        if dt is None or dt >= today:
+            out[day_key] = times
+    return out
 
 def build_message_html(free_swim: dict, evening_only: bool = False) -> str:
-    """
-    Output format:
-    <b>Понедельник – 16 февраля</b>
-    свободное плавание
-    с 08:00
-    ...
-    """
+    free_swim = filter_out_past_days(free_swim)
+
+    if not free_swim:
+        return "Нет актуальных дат в расписании."
+
     parts = []
     for day_key, times in free_swim.items():
         parts.append(f"<b>{day_key}</b>")
