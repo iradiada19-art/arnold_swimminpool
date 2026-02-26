@@ -218,9 +218,9 @@ def build_message_html(free_swim: dict, evening_only: bool = False) -> str:
     <b>Понедельник – 16 февраля</b>
     свободное плавание
     ...
-    санитарное время (only if exists)
+    санитарное время
     ...
-    санитарный день (only if exists)
+    санитарный день
     ...
     """
     parts = []
@@ -236,22 +236,26 @@ def build_message_html(free_swim: dict, evening_only: bool = False) -> str:
             sanitary_time = _filter_evening(sanitary_time)
             sanitary_day = _filter_evening(sanitary_day)
 
-        # Free swim always shown
+        # Free swim
         parts.append("свободное плавание")
         if free_times:
             parts.extend(free_times)
         else:
             parts.append("нет данных")
 
-        # Sanitary time only if exists
+        # Sanitary time
+        parts.append("санитарное время")
         if sanitary_time:
-            parts.append("санитарное время")
             parts.extend(sanitary_time)
+        else:
+            parts.append("нет данных")
 
-        # Sanitary day only if exists
+        # Sanitary day
+        parts.append("санитарный день")
         if sanitary_day:
-            parts.append("санитарный день")
             parts.extend(sanitary_day)
+        else:
+            parts.append("нет данных")
 
         parts.append("")
 
@@ -306,8 +310,7 @@ def handle_start(chat_id: int):
 def handle_button(chat_id: int, callback_id: str, evening_only: bool):
     tg_answer_callback(callback_id, "Скачиваю расписание...")
 
-    # title is not used in the message by default, but kept for possible future use
-    _title, xls_url = find_xls_link()
+    title, xls_url = find_xls_link()
     xls_bytes = download_xls(xls_url)
     parsed = parse_free_swim_from_xls(xls_bytes)
 
