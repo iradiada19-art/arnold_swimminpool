@@ -4,8 +4,6 @@ import json
 import time
 from io import BytesIO
 from urllib.parse import urljoin
-from datetime import datetime, date
-from zoneinfo import ZoneInfo
 
 import requests
 import pandas as pd
@@ -16,40 +14,57 @@ from bs4 import BeautifulSoup
 PAGE_URL = "https://www.arnold-premium.ru/raspisanie"
 LINK_TEXT_PREFIX = "Расписание работы бассейна"
 
+# Telegram token must be in env:
+#   BOT_TOKEN=123456:ABCDEF...
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("Env BOT_TOKEN is required. Example: export BOT_TOKEN='123:ABC'")
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
+# Buttons
 BTN_GET = "get_free_swim"
 BTN_EVENING = "get_free_swim_evening"
 
+# Days order in the table (usually Mon..Sun)
 DAYS = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
 
+# Evening start hour
 EVENING_FROM_HOUR = 18
 # ------------------------------------------------
 
 
 def _norm(s: str) -> str:
     s = (s or "").replace("\u00a0", " ").strip()
-    s = re.sub(r"(\d{1,2})\.(\d{2})", r"\1:\2", s)
+    s = re.sub(r"(\d{1,2})\.(\d{2})", r"\1:\2", s)  # 08.00 -> 08:00
     s = re.sub(r"\s+", " ", s)
     return s
 
 
 def find_xls_link() -> tuple[str, str]:
+    """
+    Finds the XLS link where anchor text starts with LINK_TEXT_PREFIX.
+    Returns (title_text, absolute_url).
+    """
     r = requests.get(PAGE_URL, timeout=30, headers={"User-Agent": "pool-bot/1.0"})
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
+    # Strict: text + endswith .xls
+    for a in soup.find_all("a"):
+        text = (a.get_text() or "").strip()
+        href = a.get("href") or ""
+        if text.startswith(LINK_TEXT_PREFIX) and href.lower().endswith(".xls"):
+            return text, urljoin(PAGE_URL, href)
+
+    # Soft: text + contains .xls (query params possible)
     for a in soup.find_all("a"):
         text = (a.get_text() or "").strip()
         href = a.get("href") or ""
         if text.startswith(LINK_TEXT_PREFIX) and ".xls" in href.lower():
             return text, urljoin(PAGE_URL, href)
 
-    raise RuntimeError("XLS link not found.")
+    raise RuntimeError(f"XLS link not found. Expected link text starting with: {LINK_TEXT_PREFIX}")
 
 
 def download_xls(url: str) -> bytes:
@@ -70,7 +85,7 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
     """
     sheets = pd.read_excel(BytesIO(xls_bytes), sheet_name=None, engine="xlrd")
 
-    date_pat = re.compile(r"^\s*(\d{1,2})\s+([А-Яа-яёЁ]+)\s*$")
+    date_pat = re.compile(r"^\s*(\d{1,2})\s+([А-Яа-я]+)\s*$")
     time_pat = re.compile(r"\bс\s*\d{1,2}[:.]\d{2}", re.IGNORECASE)
 
     best = {}
@@ -109,20 +124,15 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
                     continue
                 low = c.lower()
 
-                # ✅ НЕ отображаем "Семейное посещение" (и любые варианты с "семейное")
+                # skip family visits
                 if "семейное" in low:
                     continue
-
-                # ВАЖНО: не выкидываем строки без времени "раньше времени" —
-                # иначе можно потерять разметку и связанные строки.
 
                 # if cell contains "свободное", it may include the time range
                 if "свободное" in low:
                     m = re.search(r"(с\s*\d{1,2}[:.]\d{2}.*)$", c, flags=re.IGNORECASE)
                     if m:
-                        t = _norm(m.group(1))
-                        t = re.sub(r"\bс\s*(\d)\:", r"с 0\1:", t)  # 8:00 -> 08:00
-                        local[key].append(t)
+                        local[key].append(_norm(m.group(1)))
                     continue
 
                 # collect time lines like "с 12:15 до 17:15"
@@ -153,80 +163,24 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
     return best
 
 
-# -------------------- FILTER PAST DATES --------------------
-
-RU_MONTHS = {
-    "января": 1, "февраля": 2, "марта": 3, "апреля": 4,
-    "мая": 5, "июня": 6, "июля": 7, "августа": 8,
-    "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
-}
-
-
-def _today_warsaw() -> date:
-    return datetime.now(ZoneInfo("Europe/Warsaw")).date()
-
-
-def _parse_ru_day_month(s: str):
-    s = _norm(s).lower()
-    m = re.match(r"^\s*(\d{1,2})\s+([а-яё]+)\s*$", s)
-    if not m:
-        return None
-    return int(m.group(1)), RU_MONTHS.get(m.group(2))
-
-
-def _date_from_day_key(day_key: str, today: date):
-    if "–" in day_key:
-        date_part = day_key.split("–", 1)[1].strip()
-    else:
-        return None
-
-    dm = _parse_ru_day_month(date_part)
-    if not dm:
-        return None
-
-    d, mth = dm
-    if not mth:
-        return None
-
-    candidates = []
-    for y in (today.year - 1, today.year, today.year + 1):
-        try:
-            candidates.append(date(y, mth, d))
-        except ValueError:
-            continue
-
-    if not candidates:
-        return None
-
-    return min(candidates, key=lambda dt: abs((dt - today).days))
-
-
-def filter_out_past_days(free_swim: dict) -> dict:
-    today = _today_warsaw()
-    out = {}
-    for day_key, times in free_swim.items():
-        dt = _date_from_day_key(day_key, today)
-        if dt is None or dt >= today:
-            out[day_key] = times
-    return out
-
-
-# ----------------------------------------------------------
-
-
-def _start_hour_from_time_line(line: str):
+def _start_hour_from_time_line(line: str) -> int | None:
+    """
+    Extract start hour from string like 'с 20:15 до 22:45' -> 20
+    """
     m = re.search(r"\bс\s*(\d{1,2})\s*[:.]\s*(\d{2})", line, flags=re.IGNORECASE)
     if not m:
         return None
     return int(m.group(1))
 
 
-def build_message_html(free_swim: dict, evening_only=False):
-    free_swim = filter_out_past_days(free_swim)
-
-    if not free_swim:
-        return "Нет актуальных дат в расписании."
-
+def build_message_html(free_swim: dict, evening_only: bool = False) -> str:
+    """
+    Output format:
+    <b>Понедельник – 16 февраля</b>
+    свободное плавание
+    с 08:00
+    ...
+    """
     parts = []
     for day_key, times in free_swim.items():
         parts.append(f"<b>{day_key}</b>")
@@ -259,7 +213,7 @@ def keyboard():
     }
 
 
-def tg_send_message(chat_id, text, reply_markup=None, parse_mode=None):
+def tg_send_message(chat_id: int, text: str, reply_markup: dict | None = None, parse_mode: str | None = None):
     payload = {"chat_id": chat_id, "text": text}
     if reply_markup:
         payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
@@ -268,16 +222,20 @@ def tg_send_message(chat_id, text, reply_markup=None, parse_mode=None):
 
     r = requests.post(f"{TG_API}/sendMessage", data=payload, timeout=30)
     r.raise_for_status()
+    return r.json()
 
 
-def tg_answer_callback(callback_query_id, text=""):
+def tg_answer_callback(callback_query_id: str, text: str = ""):
     payload = {"callback_query_id": callback_query_id}
     if text:
         payload["text"] = text
-    requests.post(f"{TG_API}/answerCallbackQuery", data=payload, timeout=30)
+
+    r = requests.post(f"{TG_API}/answerCallbackQuery", data=payload, timeout=30)
+    r.raise_for_status()
+    return r.json()
 
 
-def get_updates(offset):
+def get_updates(offset: int) -> dict:
     r = requests.get(
         f"{TG_API}/getUpdates",
         params={"timeout": 30, "offset": offset},
@@ -287,22 +245,25 @@ def get_updates(offset):
     return r.json()
 
 
-def handle_start(chat_id):
-    tg_send_message(chat_id, "Нажми кнопку:", reply_markup=keyboard())
+def handle_start(chat_id: int):
+    tg_send_message(chat_id, "Нажми кнопку, чтобы получить свободное плавание:", reply_markup=keyboard())
 
 
-def handle_button(chat_id, callback_id, evening_only):
+def handle_button(chat_id: int, callback_id: str, evening_only: bool):
     tg_answer_callback(callback_id, "Скачиваю расписание...")
-    _, xls_url = find_xls_link()
+
+    title, xls_url = find_xls_link()
     xls_bytes = download_xls(xls_url)
     free_swim = parse_free_swim_from_xls(xls_bytes)
-    msg = build_message_html(free_swim, evening_only)
+
+    msg = build_message_html(free_swim, evening_only=evening_only)
+
     tg_send_message(chat_id, msg, reply_markup=keyboard(), parse_mode="HTML")
 
 
 def run_bot():
     offset = 0
-    print("Bot is running.")
+    print("Bot is running. Press Ctrl+C to stop.")
 
     while True:
         try:
@@ -311,23 +272,36 @@ def run_bot():
             for upd in data.get("result", []):
                 offset = upd["update_id"] + 1
 
+                # messages
                 if "message" in upd and "text" in upd["message"]:
-                    if upd["message"]["text"].strip() == "/start":
-                        handle_start(upd["message"]["chat"]["id"])
+                    chat_id = upd["message"]["chat"]["id"]
+                    text = upd["message"]["text"].strip()
 
+                    if text == "/start":
+                        handle_start(chat_id)
+
+                # callback buttons
                 if "callback_query" in upd:
                     cq = upd["callback_query"]
+                    cq_id = cq["id"]
                     chat_id = cq["message"]["chat"]["id"]
                     data_btn = cq.get("data")
 
-                    if data_btn == BTN_GET:
-                        handle_button(chat_id, cq["id"], False)
-                    elif data_btn == BTN_EVENING:
-                        handle_button(chat_id, cq["id"], True)
+                    try:
+                        if data_btn == BTN_GET:
+                            handle_button(chat_id, cq_id, evening_only=False)
+                        elif data_btn == BTN_EVENING:
+                            handle_button(chat_id, cq_id, evening_only=True)
+                        else:
+                            tg_answer_callback(cq_id)
+                    except Exception as e:
+                        tg_send_message(chat_id, f"Ошибка: {e}", reply_markup=keyboard())
 
         except KeyboardInterrupt:
+            print("Stopping...")
             break
         except Exception as e:
+            # keep alive on temporary network issues
             print("Loop error:", e)
             time.sleep(3)
 
