@@ -1,3 +1,27 @@
+import os
+import re
+import json
+import time
+from io import BytesIO
+from urllib.parse import urljoin
+
+import requests
+import pandas as pd
+from bs4 import BeautifulSoup
+
+
+# -------------------- CONFIG --------------------
+PAGE_URL = "https://www.arnold-premium.ru/raspisanie"
+LINK_TEXT_PREFIX = "Расписание работы бассейна"  # теперь ищем ВСЕ ссылки, где это встречается
+
+# Telegram token must be in env:
+#   BOT_TOKEN=123456:ABCDEF...
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+if not BOT_TOKEN:
+    raise RuntimeError("Env BOT_TOKEN is required. Example: export BOT_TOKEN='123:ABC'")
+
+TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
 # Buttons
 BTN_GET = "get_free_swim"
 BTN_EVENING = "get_free_swim_evening"
