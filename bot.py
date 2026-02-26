@@ -136,9 +136,14 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
 
                 low = c.lower()
 
-                # skip family visits
-                if "семейное" in low:
+                # --- FIX: family swim must not leak its times into other modes ---
+                # If we meet "семейное ..." then:
+                # 1) skip this row
+                # 2) reset mode so that following pure time rows won't be added
+                if "семейн" in low:  # covers "семейное", "семейный"
+                    mode = None
                     continue
+                # ----------------------------------------------------------------
 
                 # Switch modes by markers
                 if "санитарный день" in low:
@@ -212,6 +217,12 @@ def _filter_evening(times: list[str]) -> list[str]:
     return out
 
 
+# --- Optional safety-net: drop any leftover lines that mention family swim ---
+def _drop_family(lines: list[str]) -> list[str]:
+    return [x for x in lines if "семейн" not in (x or "").lower()]
+# ---------------------------------------------------------------------------
+
+
 def build_message_html(free_swim: dict, evening_only: bool = False) -> str:
     """
     Output format:
@@ -227,9 +238,9 @@ def build_message_html(free_swim: dict, evening_only: bool = False) -> str:
     for day_key, payload in free_swim.items():
         parts.append(f"<b>{day_key}</b>")
 
-        free_times = payload.get("free", [])
-        sanitary_time = payload.get("sanitary_time", [])
-        sanitary_day = payload.get("sanitary_day", [])
+        free_times = _drop_family(payload.get("free", []))
+        sanitary_time = _drop_family(payload.get("sanitary_time", []))
+        sanitary_day = _drop_family(payload.get("sanitary_day", []))
 
         if evening_only:
             free_times = _filter_evening(free_times)
