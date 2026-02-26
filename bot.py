@@ -228,6 +228,9 @@ def build_message_html(free_swim: dict, evening_only: bool = False) -> str:
     for day_key, payload in free_swim.items():
         parts.append(f"<b>{day_key}</b>")
 
+        def _drop_family(lines: list[str]) -> list[str]:
+            return [x for x in lines if "семейн" not in (x or "").lower()]
+
         free_times = payload.get("free", [])
         sanitary_time = payload.get("sanitary_time", [])
         sanitary_day = payload.get("sanitary_day", [])
