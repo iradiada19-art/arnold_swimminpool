@@ -88,7 +88,7 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
         - collect free swim times
         - collect sanitary time (санитарное время)
         - collect sanitary day (санитарный день)
-    - ignore 'семейное'
+    - ignore 'семейн'
     """
     sheets = pd.read_excel(BytesIO(xls_bytes), sheet_name=None, engine="xlrd")
 
@@ -211,7 +211,9 @@ def _filter_evening(times: list[str]) -> list[str]:
         if h is not None and h >= EVENING_FROM_HOUR:
             out.append(t)
     return out
-
+    
+def _drop_family(lines: list[str]) -> list[str]:
+    return [x for x in lines if "семейн" not in (x or "").lower()]
 
 def build_message_html(free_swim: dict, evening_only: bool = False) -> str:
     """
@@ -227,9 +229,6 @@ def build_message_html(free_swim: dict, evening_only: bool = False) -> str:
     parts = []
     for day_key, payload in free_swim.items():
         parts.append(f"<b>{day_key}</b>")
-
-        def _drop_family(lines: list[str]) -> list[str]:
-            return [x for x in lines if "семейн" not in (x or "").lower()]
 
         free_times = payload.get("free", [])
         sanitary_time = payload.get("sanitary_time", [])
