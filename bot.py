@@ -137,7 +137,8 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
                 low = c.lower()
 
                 # skip family visits
-                if "семейное" in low:
+                if "семейн" in low:
+                    mode = None
                     continue
 
                 # Switch modes by markers
