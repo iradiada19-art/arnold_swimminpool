@@ -137,7 +137,7 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
                 low = c.lower()
 
                 # skip family visits
-                if "семейн" in low:
+                if "семейное посещение" in low:
                     mode = None
                     continue
 
@@ -211,9 +211,6 @@ def _filter_evening(times: list[str]) -> list[str]:
         if h is not None and h >= EVENING_FROM_HOUR:
             out.append(t)
     return out
-    
-def _drop_family(lines: list[str]) -> list[str]:
-    return [x for x in lines if "семейн" not in (x or "").lower()]
 
 def build_message_html(free_swim: dict, evening_only: bool = False) -> str:
     """
