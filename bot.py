@@ -76,19 +76,12 @@ def download_xls(url: str) -> bytes:
 def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
     """
     Returns dict:
-      {
-        "Понедельник – 16 февраля": {"free": [...], "sanitary_time": [...], "sanitary_day": [...]},
-        ...
-      }
+      { "Понедельник – 16 февраля": ["с 08:00", "с 12:15 до 17:15", ...], ... }
 
     Strategy:
     - read all sheets
     - find row with dates like "16 февраля", "17 февраля"...
-    - for each day column:
-        - collect free swim times
-        - collect sanitary time (санитарное время)
-        - collect sanitary day (санитарный день)
-    - ignore 'семейное'
+    - for each day column: collect free swim times, ignore 'семейное'
     """
     sheets = pd.read_excel(BytesIO(xls_bytes), sheet_name=None, engine="xlrd")
 
@@ -123,66 +116,43 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
             day_name = DAYS[j]
             date_txt = header_dates[col_idx]  # e.g. "16 февраля"
             key = f"{day_name} – {date_txt}"
-
-            local[key] = {"free": [], "sanitary_time": [], "sanitary_day": []}
+            local[key] = []
 
             col_cells = [_norm(x) for x in df.iloc[date_row_idx + 1 :, col_idx].tolist()]
-
-            mode = None  # None / "free" / "sanitary_time" / "sanitary_day"
-
             for c in col_cells:
                 if not c:
                     continue
-
                 low = c.lower()
 
                 # skip family visits
                 if "семейное" in low:
                     continue
 
-                # Switch modes by markers
-                if "санитарный день" in low:
-                    mode = "sanitary_day"
-                    # may contain time ranges in the same cell
-                    m = re.search(r"(с\s*\d{1,2}[:.]\d{2}.*)$", c, flags=re.IGNORECASE)
-                    if m:
-                        local[key]["sanitary_day"].append(_norm(m.group(1)))
-                    continue
-
-                # "санитарное время" marker (covers also "санитарное")
-                if "санитар" in low:
-                    mode = "sanitary_time"
-                    m = re.search(r"(с\s*\d{1,2}[:.]\d{2}.*)$", c, flags=re.IGNORECASE)
-                    if m:
-                        local[key]["sanitary_time"].append(_norm(m.group(1)))
-                    continue
-
+                # if cell contains "свободное", it may include the time range
                 if "свободное" in low:
-                    mode = "free"
                     m = re.search(r"(с\s*\d{1,2}[:.]\d{2}.*)$", c, flags=re.IGNORECASE)
                     if m:
-                        local[key]["free"].append(_norm(m.group(1)))
+                        local[key].append(_norm(m.group(1)))
                     continue
 
-                # Time lines: attach to the current mode
-                if time_pat.search(low) and mode in ("free", "sanitary_time", "sanitary_day"):
+                # collect time lines like "с 12:15 до 17:15"
+                if time_pat.search(low):
                     m = re.search(r"(с\s*\d{1,2}[:.]\d{2}.*)$", c, flags=re.IGNORECASE)
                     if m:
                         t = _norm(m.group(1))
                         t = re.sub(r"\bс\s*(\d)\:", r"с 0\1:", t)  # 8:00 -> 08:00
-                        local[key][mode].append(t)
+                        local[key].append(t)
 
-            # Deduplicate preserving order
-            for k in ("free", "sanitary_time", "sanitary_day"):
-                seen = set()
-                cleaned = []
-                for t in local[key][k]:
-                    if t not in seen:
-                        seen.add(t)
-                        cleaned.append(t)
-                local[key][k] = cleaned
+            # deduplicate preserving order
+            seen = set()
+            cleaned = []
+            for t in local[key]:
+                if t not in seen:
+                    seen.add(t)
+                    cleaned.append(t)
+            local[key] = cleaned
 
-        score = sum(1 for v in local.values() if v["free"] or v["sanitary_time"] or v["sanitary_day"])
+        score = sum(1 for v in local.values() if v)
         if score > best_score:
             best = local
             best_score = score
@@ -203,57 +173,29 @@ def _start_hour_from_time_line(line: str) -> int | None:
     return int(m.group(1))
 
 
-def _filter_evening(times: list[str]) -> list[str]:
-    out = []
-    for t in times:
-        h = _start_hour_from_time_line(t)
-        if h is not None and h >= EVENING_FROM_HOUR:
-            out.append(t)
-    return out
-
-
 def build_message_html(free_swim: dict, evening_only: bool = False) -> str:
     """
     Output format:
     <b>Понедельник – 16 февраля</b>
     свободное плавание
-    ...
-    санитарное время
-    ...
-    санитарный день
+    с 08:00
     ...
     """
     parts = []
-    for day_key, payload in free_swim.items():
+    for day_key, times in free_swim.items():
         parts.append(f"<b>{day_key}</b>")
-
-        free_times = payload.get("free", [])
-        sanitary_time = payload.get("sanitary_time", [])
-        sanitary_day = payload.get("sanitary_day", [])
-
-        if evening_only:
-            free_times = _filter_evening(free_times)
-            sanitary_time = _filter_evening(sanitary_time)
-            sanitary_day = _filter_evening(sanitary_day)
-
-        # Free swim
         parts.append("свободное плавание")
-        if free_times:
-            parts.extend(free_times)
-        else:
-            parts.append("нет данных")
 
-        # Sanitary time
-        parts.append("санитарное время")
-        if sanitary_time:
-            parts.extend(sanitary_time)
-        else:
-            parts.append("нет данных")
+        filtered = times
+        if evening_only:
+            filtered = []
+            for t in times:
+                h = _start_hour_from_time_line(t)
+                if h is not None and h >= EVENING_FROM_HOUR:
+                    filtered.append(t)
 
-        # Sanitary day
-        parts.append("санитарный день")
-        if sanitary_day:
-            parts.extend(sanitary_day)
+        if filtered:
+            parts.extend(filtered)
         else:
             parts.append("нет данных")
 
@@ -304,7 +246,7 @@ def get_updates(offset: int) -> dict:
 
 
 def handle_start(chat_id: int):
-    tg_send_message(chat_id, "Нажми кнопку, чтобы получить расписание:", reply_markup=keyboard())
+    tg_send_message(chat_id, "Нажми кнопку, чтобы получить свободное плавание:", reply_markup=keyboard())
 
 
 def handle_button(chat_id: int, callback_id: str, evening_only: bool):
@@ -312,9 +254,9 @@ def handle_button(chat_id: int, callback_id: str, evening_only: bool):
 
     title, xls_url = find_xls_link()
     xls_bytes = download_xls(xls_url)
-    parsed = parse_free_swim_from_xls(xls_bytes)
+    free_swim = parse_free_swim_from_xls(xls_bytes)
 
-    msg = build_message_html(parsed, evening_only=evening_only)
+    msg = build_message_html(free_swim, evening_only=evening_only)
 
     tg_send_message(chat_id, msg, reply_markup=keyboard(), parse_mode="HTML")
 
