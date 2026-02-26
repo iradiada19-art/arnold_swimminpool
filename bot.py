@@ -59,6 +59,15 @@ def download_xls(url: str) -> bytes:
 
 
 def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
+    """
+    Returns dict:
+      { "Понедельник – 16 февраля": ["с 08:00", "с 12:15 до 17:15", ...], ... }
+
+    Strategy:
+    - read all sheets
+    - find row with dates like "16 февраля", "17 февраля"...
+    - for each day column: collect free swim times, ignore 'семейное'
+    """
     sheets = pd.read_excel(BytesIO(xls_bytes), sheet_name=None, engine="xlrd")
 
     date_pat = re.compile(r"^\s*(\d{1,2})\s+([А-Яа-яёЁ]+)\s*$")
@@ -70,6 +79,7 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
     for _, df in sheets.items():
         df = df.fillna("").astype(str)
 
+        # Find the header row with dates
         date_row_idx = None
         for i in range(min(len(df), 60)):
             row = [_norm(x) for x in df.iloc[i].tolist()]
@@ -89,33 +99,41 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
         local = {}
         for j, col_idx in enumerate(day_cols[:7]):
             day_name = DAYS[j]
-            date_txt = header_dates[col_idx]
+            date_txt = header_dates[col_idx]  # e.g. "16 февраля"
             key = f"{day_name} – {date_txt}"
             local[key] = []
 
             col_cells = [_norm(x) for x in df.iloc[date_row_idx + 1 :, col_idx].tolist()]
-
             for c in col_cells:
                 if not c:
                     continue
-
                 low = c.lower()
 
-                # ❌ Полностью игнорируем семейное посещение
-                if "семейное посещение" in low or "семейное" in low:
+                # ✅ НЕ отображаем "Семейное посещение" (и любые варианты с "семейное")
+                if "семейное" in low:
                     continue
 
-                # если просто текст без времени — не показываем
-                if not time_pat.search(low):
+                # ВАЖНО: не выкидываем строки без времени "раньше времени" —
+                # иначе можно потерять разметку и связанные строки.
+
+                # if cell contains "свободное", it may include the time range
+                if "свободное" in low:
+                    m = re.search(r"(с\s*\d{1,2}[:.]\d{2}.*)$", c, flags=re.IGNORECASE)
+                    if m:
+                        t = _norm(m.group(1))
+                        t = re.sub(r"\bс\s*(\d)\:", r"с 0\1:", t)  # 8:00 -> 08:00
+                        local[key].append(t)
                     continue
 
-                m = re.search(r"(с\s*\d{1,2}[:.]\d{2}.*)$", c, flags=re.IGNORECASE)
-                if m:
-                    t = _norm(m.group(1))
-                    t = re.sub(r"\bс\s*(\d)\:", r"с 0\1:", t)
-                    local[key].append(t)
+                # collect time lines like "с 12:15 до 17:15"
+                if time_pat.search(low):
+                    m = re.search(r"(с\s*\d{1,2}[:.]\d{2}.*)$", c, flags=re.IGNORECASE)
+                    if m:
+                        t = _norm(m.group(1))
+                        t = re.sub(r"\bс\s*(\d)\:", r"с 0\1:", t)  # 8:00 -> 08:00
+                        local[key].append(t)
 
-            # удаляем дубли
+            # deduplicate preserving order
             seen = set()
             cleaned = []
             for t in local[key]:
@@ -130,7 +148,7 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
             best_score = score
 
     if not best:
-        raise RuntimeError("Failed to parse XLS.")
+        raise RuntimeError("Failed to parse XLS (no recognizable date/time layout).")
 
     return best
 
