@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup
 
 # -------------------- CONFIG --------------------
 PAGE_URL = "https://www.arnold-premium.ru/raspisanie"
-LINK_TEXT_PREFIX = "Расписание работы бассейна"  # теперь ищем ВСЕ ссылки, где это встречается
+LINK_TEXT_PREFIX = "Расписание работы бассейна"
 
 # Telegram token must be in env:
 #   BOT_TOKEN=123456:ABCDEF...
@@ -31,9 +31,6 @@ DAYS = ["Понедельник", "Вторник", "Среда", "Четвер�
 
 # Evening start hour
 EVENING_FROM_HOUR = 18
-
-# Telegram hard limit is 4096 chars. We'll keep margin for HTML.
-TG_MAX_CHARS = 3900
 # ------------------------------------------------
 
 
@@ -44,47 +41,30 @@ def _norm(s: str) -> str:
     return s
 
 
-def find_all_xls_links() -> list[tuple[str, str]]:
+def find_xls_link() -> tuple[str, str]:
     """
-    Finds ALL XLS links where anchor text contains LINK_TEXT_PREFIX (case-insensitive).
-    Returns list of (title_text, absolute_url).
+    Finds the XLS link where anchor text starts with LINK_TEXT_PREFIX.
+    Returns (title_text, absolute_url).
     """
     r = requests.get(PAGE_URL, timeout=30, headers={"User-Agent": "pool-bot/1.0"})
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
-    prefix_low = LINK_TEXT_PREFIX.lower()
-    found: list[tuple[str, str]] = []
-    seen_urls: set[str] = set()
-
+    # Strict: text + endswith .xls
     for a in soup.find_all("a"):
         text = (a.get_text() or "").strip()
         href = a.get("href") or ""
-        if not text or not href:
-            continue
+        if text.startswith(LINK_TEXT_PREFIX) and href.lower().endswith(".xls"):
+            return text, urljoin(PAGE_URL, href)
 
-        # match by text containing prefix
-        if prefix_low not in text.lower():
-            continue
+    # Soft: text + contains .xls (query params possible)
+    for a in soup.find_all("a"):
+        text = (a.get_text() or "").strip()
+        href = a.get("href") or ""
+        if text.startswith(LINK_TEXT_PREFIX) and ".xls" in href.lower():
+            return text, urljoin(PAGE_URL, href)
 
-        # accept .xls (including with query params)
-        href_low = href.lower()
-        if not (href_low.endswith(".xls") or ".xls" in href_low):
-            continue
-
-        abs_url = urljoin(PAGE_URL, href)
-        if abs_url in seen_urls:
-            continue
-
-        seen_urls.add(abs_url)
-        found.append((text, abs_url))
-
-    if not found:
-        raise RuntimeError(
-            f"Не нашла XLS-файлы. Ожидала ссылки, где текст содержит: {LINK_TEXT_PREFIX}"
-        )
-
-    return found
+    raise RuntimeError(f"XLS link not found. Expected link text starting with: {LINK_TEXT_PREFIX}")
 
 
 def download_xls(url: str) -> bytes:
@@ -101,10 +81,14 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
         ...
       }
 
-    - 'свободное плавание' -> free
-    - 'санитарное время'   -> sanitary_time
-    - 'санитарный день'    -> sanitary_day
-    Shown in output only if exists (for sanitary blocks).
+    Strategy:
+    - read all sheets
+    - find row with dates like "16 февраля", "17 февраля"...
+    - for each day column:
+        - collect free swim times
+        - collect sanitary time (санитарное время)
+        - collect sanitary day (санитарный день)
+    - ignore 'семейное'
     """
     sheets = pd.read_excel(BytesIO(xls_bytes), sheet_name=None, engine="xlrd")
 
@@ -119,7 +103,7 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
 
         # Find the header row with dates
         date_row_idx = None
-        for i in range(min(len(df), 70)):
+        for i in range(min(len(df), 60)):
             row = [_norm(x) for x in df.iloc[i].tolist()]
             hits = sum(1 for x in row if date_pat.match(x))
             if hits >= 3:
@@ -159,12 +143,13 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
                 # Switch modes by markers
                 if "санитарный день" in low:
                     mode = "sanitary_day"
+                    # may contain time ranges in the same cell
                     m = re.search(r"(с\s*\d{1,2}[:.]\d{2}.*)$", c, flags=re.IGNORECASE)
                     if m:
                         local[key]["sanitary_day"].append(_norm(m.group(1)))
                     continue
 
-                # "санитарное время" (or any "санитар...")
+                # "санитарное время" marker (covers also "санитарное")
                 if "санитар" in low:
                     mode = "sanitary_time"
                     m = re.search(r"(с\s*\d{1,2}[:.]\d{2}.*)$", c, flags=re.IGNORECASE)
@@ -209,6 +194,9 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
 
 
 def _start_hour_from_time_line(line: str) -> int | None:
+    """
+    Extract start hour from string like 'с 20:15 до 22:45' -> 20
+    """
     m = re.search(r"\bс\s*(\d{1,2})\s*[:.]\s*(\d{2})", line, flags=re.IGNORECASE)
     if not m:
         return None
@@ -224,9 +212,9 @@ def _filter_evening(times: list[str]) -> list[str]:
     return out
 
 
-def build_message_html(parsed: dict, evening_only: bool = False) -> str:
+def build_message_html(free_swim: dict, evening_only: bool = False) -> str:
     """
-    Per file:
+    Output format:
     <b>Понедельник – 16 февраля</b>
     свободное плавание
     ...
@@ -236,7 +224,7 @@ def build_message_html(parsed: dict, evening_only: bool = False) -> str:
     ...
     """
     parts = []
-    for day_key, payload in parsed.items():
+    for day_key, payload in free_swim.items():
         parts.append(f"<b>{day_key}</b>")
 
         free_times = payload.get("free", [])
@@ -311,37 +299,6 @@ def get_updates(offset: int) -> dict:
     return r.json()
 
 
-def _split_for_telegram(html_text: str, max_len: int = TG_MAX_CHARS) -> list[str]:
-    """
-    Split long HTML message by safe boundaries (double newline).
-    We keep it simple: split by blocks and accumulate.
-    """
-    blocks = html_text.split("\n\n")
-    chunks: list[str] = []
-    buf = ""
-
-    for b in blocks:
-        piece = (b + "\n\n")
-        if len(buf) + len(piece) <= max_len:
-            buf += piece
-        else:
-            if buf.strip():
-                chunks.append(buf.strip())
-            # if block alone is too big, hard-split
-            if len(piece) > max_len:
-                s = piece.strip()
-                while len(s) > max_len:
-                    chunks.append(s[:max_len])
-                    s = s[max_len:]
-                buf = s + "\n\n" if s else ""
-            else:
-                buf = piece
-
-    if buf.strip():
-        chunks.append(buf.strip())
-    return chunks
-
-
 def handle_start(chat_id: int):
     tg_send_message(chat_id, "Нажми кнопку, чтобы получить расписание:", reply_markup=keyboard())
 
@@ -349,27 +306,14 @@ def handle_start(chat_id: int):
 def handle_button(chat_id: int, callback_id: str, evening_only: bool):
     tg_answer_callback(callback_id, "Скачиваю расписание...")
 
-    links = find_all_xls_links()  # <-- теперь берем ВСЕ файлы
+    # title is not used in the message by default, but kept for possible future use
+    _title, xls_url = find_xls_link()
+    xls_bytes = download_xls(xls_url)
+    parsed = parse_free_swim_from_xls(xls_bytes)
 
-    # Собираем единый HTML, где каждый файл отделён заголовком и линией
-    parts: list[str] = []
-    for title, xls_url in links:
-        xls_bytes = download_xls(xls_url)
-        parsed = parse_free_swim_from_xls(xls_bytes)
-        body = build_message_html(parsed, evening_only=evening_only)
+    msg = build_message_html(parsed, evening_only=evening_only)
 
-        # Заголовок файла (жирным) + (опционально) ссылка
-        parts.append(f"<b>{_norm(title)}</b>")
-        # Если хочешь показывать ссылку — раскомментируй:
-        # parts.append(_norm(xls_url))
-        parts.append(body)
-        parts.append("—" * 20)  # разделитель между файлами
-
-    full = "\n\n".join(parts).strip()
-
-    # Telegram limit: send in chunks if needed
-    for chunk in _split_for_telegram(full):
-        tg_send_message(chat_id, chunk, reply_markup=keyboard(), parse_mode="HTML")
+    tg_send_message(chat_id, msg, reply_markup=keyboard(), parse_mode="HTML")
 
 
 def run_bot():
@@ -387,6 +331,7 @@ def run_bot():
                 if "message" in upd and "text" in upd["message"]:
                     chat_id = upd["message"]["chat"]["id"]
                     text = upd["message"]["text"].strip()
+
                     if text == "/start":
                         handle_start(chat_id)
 
