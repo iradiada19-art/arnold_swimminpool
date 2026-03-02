@@ -422,3 +422,5 @@ def run_bot():
 
 if __name__ == "__main__":
     run_bot()
+    
+print("GROQ_API_KEY:", os.getenv("GROQ_API_KEY"))
