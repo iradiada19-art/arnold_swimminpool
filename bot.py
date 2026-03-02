@@ -157,7 +157,7 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
                     continue
                     
                 # skip graf visits
-                if "клуб" in low:
+                if "работает" in low:
                     continue
 
                 # Switch modes by markers
@@ -423,4 +423,3 @@ def run_bot():
 if __name__ == "__main__":
     run_bot()
     
-print("GROQ_API_KEY:", os.getenv("GROQ_API_KEY"))
