@@ -157,7 +157,7 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
                     continue
                     
                 # skip graf visits
-                if "работает" in low:
+                if "клуб работает" in low:
                     continue
 
                 # Switch modes by markers
