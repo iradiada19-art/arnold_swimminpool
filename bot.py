@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup
 
 # -------------------- CONFIG --------------------
 PAGE_URL = "https://www.arnold-premium.ru/raspisanie"
-LINK_TEXT_PREFIX = "Расписание работы бассейна"  # ищем все ссылки, которые начинаются с этого текста
+LINK_TEXT_PREFIX = "Расписание работы бассейна"  # теперь ищем ВСЕ ссылки, где это встречается
 
 # Telegram token must be in env:
 #   BOT_TOKEN=123456:ABCDEF...
@@ -32,78 +32,80 @@ DAYS = ["Понедельник", "Вторник", "Среда", "Четвер�
 # Evening start hour
 EVENING_FROM_HOUR = 18
 
-# Сколько XLS максимум обрабатывать (на странице их может быть много)
-MAX_XLS_FILES = 10
+# Telegram hard limit is 4096 chars. We'll keep margin for HTML.
+TG_MAX_CHARS = 3900
 # ------------------------------------------------
 
 
 def _norm(s: str) -> str:
-    """Нормализуем текст из ячейки."""
     s = (s or "").replace("\u00a0", " ").strip()
     s = re.sub(r"(\d{1,2})\.(\d{2})", r"\1:\2", s)  # 08.00 -> 08:00
     s = re.sub(r"\s+", " ", s)
     return s
 
 
-def _http_get(url: str, timeout: int = 30) -> requests.Response:
-    """Обычный GET с User-Agent (иногда сайты режут без него)."""
-    return requests.get(url, timeout=timeout, headers={"User-Agent": "pool-bot/1.1"})
-
-
-def find_xls_links() -> list[tuple[str, str]]:
+def find_all_xls_links() -> list[tuple[str, str]]:
     """
-    Находит ВСЕ XLS-ссылки, где текст <a> начинается с LINK_TEXT_PREFIX.
-    Возвращает список (title_text, absolute_url).
+    Finds ALL XLS links where anchor text contains LINK_TEXT_PREFIX (case-insensitive).
+    Returns list of (title_text, absolute_url).
     """
-    r = _http_get(PAGE_URL, timeout=30)
+    r = requests.get(PAGE_URL, timeout=30, headers={"User-Agent": "pool-bot/1.0"})
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
+    prefix_low = LINK_TEXT_PREFIX.lower()
     found: list[tuple[str, str]] = []
+    seen_urls: set[str] = set()
+
     for a in soup.find_all("a"):
         text = (a.get_text() or "").strip()
-        href = (a.get("href") or "").strip()
-        if not text.startswith(LINK_TEXT_PREFIX):
+        href = a.get("href") or ""
+        if not text or not href:
             continue
-        if ".xls" not in href.lower():
+
+        # match by text containing prefix
+        if prefix_low not in text.lower():
             continue
+
+        # accept .xls (including with query params)
+        href_low = href.lower()
+        if not (href_low.endswith(".xls") or ".xls" in href_low):
+            continue
+
         abs_url = urljoin(PAGE_URL, href)
+        if abs_url in seen_urls:
+            continue
+
+        seen_urls.add(abs_url)
         found.append((text, abs_url))
 
-    # уберем дубликаты, сохранив порядок
-    seen = set()
-    uniq: list[tuple[str, str]] = []
-    for t, u in found:
-        key = (t, u)
-        if key in seen:
-            continue
-        seen.add(key)
-        uniq.append((t, u))
+    if not found:
+        raise RuntimeError(
+            f"Не нашла XLS-файлы. Ожидала ссылки, где текст содержит: {LINK_TEXT_PREFIX}"
+        )
 
-    if not uniq:
-        raise RuntimeError(f"XLS links not found. Expected link text starting with: {LINK_TEXT_PREFIX}")
-
-    return uniq[:MAX_XLS_FILES]
+    return found
 
 
 def download_xls(url: str) -> bytes:
-    r = _http_get(url, timeout=60)
+    r = requests.get(url, timeout=60, headers={"User-Agent": "pool-bot/1.0"})
     r.raise_for_status()
     return r.content
 
 
 def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
     """
-    Возвращает dict:
+    Returns dict:
       {
         "Понедельник – 16 февраля": {"free": [...], "sanitary_time": [...], "sanitary_day": [...]},
         ...
       }
 
-    Важно:
-    - "семейное плавание" должно полностью игнорироваться (и строки-времена под ним тоже)
+    - 'свободное плавание' -> free
+    - 'санитарное время'   -> sanitary_time
+    - 'санитарный день'    -> sanitary_day
+    Shown in output only if exists (for sanitary blocks).
     """
-    # .xls читается через xlrd (пакет должен быть установлен в окружении)
     sheets = pd.read_excel(BytesIO(xls_bytes), sheet_name=None, engine="xlrd")
 
     date_pat = re.compile(r"^\s*(\d{1,2})\s+([А-Яа-я]+)\s*$")
@@ -115,14 +117,15 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
     for _, df in sheets.items():
         df = df.fillna("").astype(str)
 
-        # Ищем строку заголовка, где много дат вида "16 февраля"
+        # Find the header row with dates
         date_row_idx = None
-        for i in range(min(len(df), 80)):
+        for i in range(min(len(df), 70)):
             row = [_norm(x) for x in df.iloc[i].tolist()]
             hits = sum(1 for x in row if date_pat.match(x))
             if hits >= 3:
                 date_row_idx = i
                 break
+
         if date_row_idx is None:
             continue
 
@@ -134,14 +137,14 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
         local = {}
         for j, col_idx in enumerate(day_cols[:7]):
             day_name = DAYS[j]
-            date_txt = header_dates[col_idx]  # например "16 февраля"
+            date_txt = header_dates[col_idx]  # e.g. "16 февраля"
             key = f"{day_name} – {date_txt}"
 
             local[key] = {"free": [], "sanitary_time": [], "sanitary_day": []}
+
             col_cells = [_norm(x) for x in df.iloc[date_row_idx + 1 :, col_idx].tolist()]
 
-            # mode: None / "free" / "sanitary_time" / "sanitary_day" / "family_skip"
-            mode = None
+            mode = None  # None / "free" / "sanitary_time" / "sanitary_day"
 
             for c in col_cells:
                 if not c:
@@ -149,26 +152,11 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
 
                 low = c.lower()
 
-                # --- семейное: включаем режим пропуска блока ---
-                # Частая структура в XLS:
-                #   "Семейное плавание"
-                #   "с 16:00 до 17:00"
-                # Поэтому просто continue недостаточно — нужно "отвязать" последующие времена.
-                if "семейн" in low:  # покрывает семейное/семейный
-                    mode = "family_skip"
+                # skip family visits
+                if "семейное" in low:
                     continue
 
-                # Если мы внутри семейного блока — пропускаем строки времени,
-                # пока не встретим следующий "нормальный" маркер.
-                if mode == "family_skip":
-                    # Если встретили маркер свободного/санитарного — выходим из family_skip
-                    if ("свободное" in low) or ("санитарный день" in low) or ("санитар" in low):
-                        pass
-                    else:
-                        # любые строки (в том числе с временем) пропускаем
-                        continue
-
-                # --- маркеры режимов ---
+                # Switch modes by markers
                 if "санитарный день" in low:
                     mode = "sanitary_day"
                     m = re.search(r"(с\s*\d{1,2}[:.]\d{2}.*)$", c, flags=re.IGNORECASE)
@@ -176,7 +164,7 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
                         local[key]["sanitary_day"].append(_norm(m.group(1)))
                     continue
 
-                # санитарное время / санитарное
+                # "санитарное время" (or any "санитар...")
                 if "санитар" in low:
                     mode = "sanitary_time"
                     m = re.search(r"(с\s*\d{1,2}[:.]\d{2}.*)$", c, flags=re.IGNORECASE)
@@ -191,7 +179,7 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
                         local[key]["free"].append(_norm(m.group(1)))
                     continue
 
-                # --- строки со временем ---
+                # Time lines: attach to the current mode
                 if time_pat.search(low) and mode in ("free", "sanitary_time", "sanitary_day"):
                     m = re.search(r"(с\s*\d{1,2}[:.]\d{2}.*)$", c, flags=re.IGNORECASE)
                     if m:
@@ -199,15 +187,14 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
                         t = re.sub(r"\bс\s*(\d)\:", r"с 0\1:", t)  # 8:00 -> 08:00
                         local[key][mode].append(t)
 
-            # Дедупликация, сохраняя порядок
+            # Deduplicate preserving order
             for k in ("free", "sanitary_time", "sanitary_day"):
                 seen = set()
                 cleaned = []
                 for t in local[key][k]:
-                    if t in seen:
-                        continue
-                    seen.add(t)
-                    cleaned.append(t)
+                    if t not in seen:
+                        seen.add(t)
+                        cleaned.append(t)
                 local[key][k] = cleaned
 
         score = sum(1 for v in local.values() if v["free"] or v["sanitary_time"] or v["sanitary_day"])
@@ -222,7 +209,6 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
 
 
 def _start_hour_from_time_line(line: str) -> int | None:
-    """Достаём час начала из строки вида 'с 20:15 до 22:45' -> 20."""
     m = re.search(r"\bс\s*(\d{1,2})\s*[:.]\s*(\d{2})", line, flags=re.IGNORECASE)
     if not m:
         return None
@@ -230,7 +216,6 @@ def _start_hour_from_time_line(line: str) -> int | None:
 
 
 def _filter_evening(times: list[str]) -> list[str]:
-    """Оставляем только интервалы, которые начинаются с EVENING_FROM_HOUR и позже."""
     out = []
     for t in times:
         h = _start_hour_from_time_line(t)
@@ -239,49 +224,48 @@ def _filter_evening(times: list[str]) -> list[str]:
     return out
 
 
-def build_message_html_all(files_payload: list[tuple[str, dict]], evening_only: bool = False) -> str:
+def build_message_html(parsed: dict, evening_only: bool = False) -> str:
     """
-    Формируем сообщение сразу по нескольким XLS-файлам.
-    Чтобы "второй файл" не терялся — выводим блоками:
-      <b>Название файла</b>
-      <b>Понедельник – ...</b>
-      ...
+    Per file:
+    <b>Понедельник – 16 февраля</b>
+    свободное плавание
+    ...
+    санитарное время (only if exists)
+    ...
+    санитарный день (only if exists)
+    ...
     """
-    parts: list[str] = []
+    parts = []
+    for day_key, payload in parsed.items():
+        parts.append(f"<b>{day_key}</b>")
 
-    for title, parsed in files_payload:
-        parts.append(f"<b>{_norm(title)}</b>")
-        parts.append("")  # пустая строка
+        free_times = payload.get("free", [])
+        sanitary_time = payload.get("sanitary_time", [])
+        sanitary_day = payload.get("sanitary_day", [])
 
-        for day_key, payload in parsed.items():
-            parts.append(f"<b>{day_key}</b>")
+        if evening_only:
+            free_times = _filter_evening(free_times)
+            sanitary_time = _filter_evening(sanitary_time)
+            sanitary_day = _filter_evening(sanitary_day)
 
-            free_times = payload.get("free", [])
-            sanitary_time = payload.get("sanitary_time", [])
-            sanitary_day = payload.get("sanitary_day", [])
+        # Free swim always shown
+        parts.append("свободное плавание")
+        if free_times:
+            parts.extend(free_times)
+        else:
+            parts.append("нет данных")
 
-            if evening_only:
-                free_times = _filter_evening(free_times)
-                sanitary_time = _filter_evening(sanitary_time)
-                sanitary_day = _filter_evening(sanitary_day)
+        # Sanitary time only if exists
+        if sanitary_time:
+            parts.append("санитарное время")
+            parts.extend(sanitary_time)
 
-            parts.append("свободное плавание")
-            if free_times:
-                parts.extend(free_times)
-            else:
-                parts.append("нет данных")
+        # Sanitary day only if exists
+        if sanitary_day:
+            parts.append("санитарный день")
+            parts.extend(sanitary_day)
 
-            if sanitary_time:
-                parts.append("санитарное время")
-                parts.extend(sanitary_time)
-
-            if sanitary_day:
-                parts.append("санитарный день")
-                parts.extend(sanitary_day)
-
-            parts.append("")  # пустая строка между днями
-
-        parts.append("")  # пустая строка между файлами
+        parts.append("")
 
     return "\n".join(parts).strip()
 
@@ -327,6 +311,37 @@ def get_updates(offset: int) -> dict:
     return r.json()
 
 
+def _split_for_telegram(html_text: str, max_len: int = TG_MAX_CHARS) -> list[str]:
+    """
+    Split long HTML message by safe boundaries (double newline).
+    We keep it simple: split by blocks and accumulate.
+    """
+    blocks = html_text.split("\n\n")
+    chunks: list[str] = []
+    buf = ""
+
+    for b in blocks:
+        piece = (b + "\n\n")
+        if len(buf) + len(piece) <= max_len:
+            buf += piece
+        else:
+            if buf.strip():
+                chunks.append(buf.strip())
+            # if block alone is too big, hard-split
+            if len(piece) > max_len:
+                s = piece.strip()
+                while len(s) > max_len:
+                    chunks.append(s[:max_len])
+                    s = s[max_len:]
+                buf = s + "\n\n" if s else ""
+            else:
+                buf = piece
+
+    if buf.strip():
+        chunks.append(buf.strip())
+    return chunks
+
+
 def handle_start(chat_id: int):
     tg_send_message(chat_id, "Нажми кнопку, чтобы получить расписание:", reply_markup=keyboard())
 
@@ -334,41 +349,27 @@ def handle_start(chat_id: int):
 def handle_button(chat_id: int, callback_id: str, evening_only: bool):
     tg_answer_callback(callback_id, "Скачиваю расписание...")
 
-    links = find_xls_links()  # <-- теперь получаем ВСЕ файлы, а не один
-    files_payload: list[tuple[str, dict]] = []
+    links = find_all_xls_links()  # <-- теперь берем ВСЕ файлы
 
+    # Собираем единый HTML, где каждый файл отделён заголовком и линией
+    parts: list[str] = []
     for title, xls_url in links:
-        try:
-            xls_bytes = download_xls(xls_url)
-            parsed = parse_free_swim_from_xls(xls_bytes)
-            files_payload.append((title, parsed))
-        except Exception as e:
-            # если какой-то файл сломан/недоступен — не валим всё сообщение целиком
-            files_payload.append((f"{title} (ошибка чтения)", {"": {"free": [f"Ошибка: {e}"], "sanitary_time": [], "sanitary_day": []}}))
+        xls_bytes = download_xls(xls_url)
+        parsed = parse_free_swim_from_xls(xls_bytes)
+        body = build_message_html(parsed, evening_only=evening_only)
 
-    msg = build_message_html_all(files_payload, evening_only=evening_only)
+        # Заголовок файла (жирным) + (опционально) ссылка
+        parts.append(f"<b>{_norm(title)}</b>")
+        # Если хочешь показывать ссылку — раскомментируй:
+        # parts.append(_norm(xls_url))
+        parts.append(body)
+        parts.append("—" * 20)  # разделитель между файлами
 
-    # Telegram имеет лимит длины (4096). Если расписания много — режем на части.
-    MAX_LEN = 3900
-    if len(msg) <= MAX_LEN:
-        tg_send_message(chat_id, msg, reply_markup=keyboard(), parse_mode="HTML")
-        return
+    full = "\n\n".join(parts).strip()
 
-    # разрезаем по строкам, стараясь не ломать HTML-теги (у нас только <b>..</b>)
-    lines = msg.split("\n")
-    chunk = []
-    size = 0
-    for line in lines:
-        add = line + "\n"
-        if size + len(add) > MAX_LEN and chunk:
-            tg_send_message(chat_id, "".join(chunk).strip(), reply_markup=keyboard(), parse_mode="HTML")
-            chunk = []
-            size = 0
-        chunk.append(add)
-        size += len(add)
-
-    if chunk:
-        tg_send_message(chat_id, "".join(chunk).strip(), reply_markup=keyboard(), parse_mode="HTML")
+    # Telegram limit: send in chunks if needed
+    for chunk in _split_for_telegram(full):
+        tg_send_message(chat_id, chunk, reply_markup=keyboard(), parse_mode="HTML")
 
 
 def run_bot():
@@ -386,7 +387,6 @@ def run_bot():
                 if "message" in upd and "text" in upd["message"]:
                     chat_id = upd["message"]["chat"]["id"]
                     text = upd["message"]["text"].strip()
-
                     if text == "/start":
                         handle_start(chat_id)
 
