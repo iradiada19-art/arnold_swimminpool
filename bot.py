@@ -16,14 +16,22 @@ LINK_TEXT_PREFIX = "Расписание работы бассейна"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
-    raise RuntimeError("Env BOT_TOKEN is required.")
+    raise RuntimeError("Env BOT_TOKEN is required")
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 BTN_GET = "get_free_swim"
 BTN_EVENING = "get_free_swim_evening"
 
-DAYS = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+DAYS = [
+    "Понедельник",
+    "Вторник",
+    "Среда",
+    "Четверг",
+    "Пятница",
+    "Суббота",
+    "Воскресенье"
+]
 
 EVENING_FROM_HOUR = 18
 MAX_XLS_FILES = 10
@@ -37,11 +45,12 @@ def _norm(s: str) -> str:
     return s
 
 
-def _http_get(url: str, timeout: int = 30) -> requests.Response:
-    return requests.get(url, timeout=timeout, headers={"User-Agent": "pool-bot/1.1"})
+def _http_get(url: str, timeout: int = 30):
+    return requests.get(url, timeout=timeout, headers={"User-Agent": "pool-bot"})
 
 
-def find_xls_links() -> list[tuple[str, str]]:
+def find_xls_links():
+
     r = _http_get(PAGE_URL)
     r.raise_for_status()
 
@@ -50,6 +59,7 @@ def find_xls_links() -> list[tuple[str, str]]:
     found = []
 
     for a in soup.find_all("a"):
+
         text = (a.get_text() or "").strip()
         href = (a.get("href") or "").strip()
 
@@ -60,10 +70,11 @@ def find_xls_links() -> list[tuple[str, str]]:
             continue
 
         abs_url = urljoin(PAGE_URL, href)
+
         found.append((text, abs_url))
 
-    seen = set()
     uniq = []
+    seen = set()
 
     for t, u in found:
         if (t, u) not in seen:
@@ -73,17 +84,18 @@ def find_xls_links() -> list[tuple[str, str]]:
     return uniq[:MAX_XLS_FILES]
 
 
-def download_xls(url: str) -> bytes:
+def download_xls(url: str):
+
     r = _http_get(url, timeout=60)
     r.raise_for_status()
     return r.content
 
 
-def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
+def parse_free_swim_from_xls(xls_bytes: bytes):
 
     sheets = pd.read_excel(BytesIO(xls_bytes), sheet_name=None, engine="xlrd")
 
-    date_pat = re.compile(r"^\s*(\d{1,2})\s+([А-Яа-я]+)\s*$")
+    date_pat = re.compile(r"^\s*(\d{1,2})\s+([А-Яа-я]+)")
     time_pat = re.compile(r"\bс\s*\d{1,2}[:.]\d{2}", re.IGNORECASE)
 
     best = {}
@@ -96,7 +108,9 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
         date_row_idx = None
 
         for i in range(min(len(df), 80)):
+
             row = [_norm(x) for x in df.iloc[i].tolist()]
+
             hits = sum(1 for x in row if date_pat.match(x))
 
             if hits >= 3:
@@ -107,7 +121,11 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
             continue
 
         header_dates = [_norm(x) for x in df.iloc[date_row_idx].tolist()]
-        day_cols = [idx for idx, cell in enumerate(header_dates) if date_pat.match(cell)]
+
+        day_cols = [
+            idx for idx, cell in enumerate(header_dates)
+            if date_pat.match(cell)
+        ]
 
         local = {}
 
@@ -124,7 +142,10 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
                 "sanitary_day": []
             }
 
-            col_cells = [_norm(x) for x in df.iloc[date_row_idx + 1:, col_idx].tolist()]
+            col_cells = [
+                _norm(x)
+                for x in df.iloc[date_row_idx + 1:, col_idx].tolist()
+            ]
 
             mode = None
 
@@ -135,7 +156,6 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
 
                 low = c.lower()
 
-                # --- семейное плавание ---
                 if "семейн" in low:
                     mode = "family_skip"
                     continue
@@ -147,7 +167,6 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
                     else:
                         continue
 
-                # --- санитарный день ---
                 if "санитарный день" in low:
 
                     mode = "sanitary_day"
@@ -161,7 +180,6 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
 
                     continue
 
-                # --- санитарное время ---
                 if "санитар" in low:
 
                     mode = "sanitary_time"
@@ -173,7 +191,6 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
 
                     continue
 
-                # --- свободное ---
                 if "свободное" in low:
 
                     mode = "free"
@@ -185,42 +202,28 @@ def parse_free_swim_from_xls(xls_bytes: bytes) -> dict:
 
                     continue
 
-                # --- строки времени ---
-                if time_pat.search(low) and mode in ("free", "sanitary_time", "sanitary_day"):
+                if time_pat.search(low) and mode in ("free", "sanitary_time"):
 
                     m = re.search(r"(с\s*\d{1,2}[:.]\d{2}.*)$", c, re.IGNORECASE)
 
                     if m:
-                        t = _norm(m.group(1))
-                        t = re.sub(r"\bс\s*(\d)\:", r"с 0\1:", t)
+                        local[key][mode].append(_norm(m.group(1)))
 
-                        local[key][mode].append(t)
+            score = sum(
+                len(v["free"]) +
+                len(v["sanitary_time"]) +
+                len(v["sanitary_day"])
+                for v in local.values()
+            )
 
-            # удаляем дубликаты
-
-            for k in ("free", "sanitary_time", "sanitary_day"):
-
-                seen = set()
-                cleaned = []
-
-                for t in local[key][k]:
-
-                    if t not in seen:
-                        seen.add(t)
-                        cleaned.append(t)
-
-                local[key][k] = cleaned
-
-        score = sum(1 for v in local.values() if v["free"] or v["sanitary_time"] or v["sanitary_day"])
-
-        if score > best_score:
-            best = local
-            best_score = score
+            if score > best_score:
+                best = local
+                best_score = score
 
     return best
 
 
-def _start_hour_from_time_line(line: str):
+def _start_hour_from_time_line(line):
 
     m = re.search(r"\bс\s*(\d{1,2})[:.](\d{2})", line)
 
@@ -255,8 +258,6 @@ def build_message_html_all(files_payload, evening_only=False):
 
         for day_key, payload in parsed.items():
 
-            parts.append(f"<b>{day_key}</b>")
-
             free_times = payload.get("free", [])
             sanitary_time = payload.get("sanitary_time", [])
             sanitary_day = payload.get("sanitary_day", [])
@@ -267,12 +268,21 @@ def build_message_html_all(files_payload, evening_only=False):
                 sanitary_time = _filter_evening(sanitary_time)
                 sanitary_day = _filter_evening(sanitary_day)
 
+            parts.append(f"<b>{day_key}</b>")
+
+            if not free_times and not sanitary_time and not sanitary_day:
+
+                parts.append("санитарный день")
+                parts.append("весь день")
+                parts.append("")
+                continue
+
             parts.append("свободное плавание")
 
             if free_times:
                 parts.extend(free_times)
             else:
-                parts.append("нет данных")
+                parts.append("нет")
 
             if sanitary_time:
 
@@ -294,8 +304,8 @@ def build_message_html_all(files_payload, evening_only=False):
 def keyboard():
     return {
         "inline_keyboard": [
-            [{"text": "Получить расписание (свободное плавание)", "callback_data": BTN_GET}],
-            [{"text": "Только вечер", "callback_data": BTN_EVENING}],
+            [{"text": "Получить расписание", "callback_data": BTN_GET}],
+            [{"text": "Только вечер", "callback_data": BTN_EVENING}]
         ]
     }
 
@@ -314,8 +324,6 @@ def tg_send_message(chat_id, text, reply_markup=None, parse_mode=None):
 
     r.raise_for_status()
 
-    return r.json()
-
 
 def tg_answer_callback(callback_query_id, text=""):
 
@@ -324,11 +332,7 @@ def tg_answer_callback(callback_query_id, text=""):
     if text:
         payload["text"] = text
 
-    r = requests.post(f"{TG_API}/answerCallbackQuery", data=payload, timeout=30)
-
-    r.raise_for_status()
-
-    return r.json()
+    requests.post(f"{TG_API}/answerCallbackQuery", data=payload, timeout=30)
 
 
 def get_updates(offset):
@@ -346,7 +350,11 @@ def get_updates(offset):
 
 def handle_start(chat_id):
 
-    tg_send_message(chat_id, "Нажми кнопку, чтобы получить расписание:", reply_markup=keyboard())
+    tg_send_message(
+        chat_id,
+        "Нажми кнопку, чтобы получить расписание:",
+        reply_markup=keyboard()
+    )
 
 
 def handle_button(chat_id, callback_id, evening_only):
@@ -357,30 +365,37 @@ def handle_button(chat_id, callback_id, evening_only):
 
     files_payload = []
 
-    for title, xls_url in links:
+    for title, url in links:
 
         try:
 
-            xls_bytes = download_xls(xls_url)
+            xls = download_xls(url)
 
-            parsed = parse_free_swim_from_xls(xls_bytes)
+            parsed = parse_free_swim_from_xls(xls)
 
             files_payload.append((title, parsed))
 
         except Exception as e:
 
-            files_payload.append((title, {"": {"free": [f"Ошибка: {e}"], "sanitary_time": [], "sanitary_day": []}}))
+            files_payload.append(
+                (title, {"Ошибка": {"free": [str(e)], "sanitary_time": [], "sanitary_day": []}})
+            )
 
     msg = build_message_html_all(files_payload, evening_only)
 
-    tg_send_message(chat_id, msg, reply_markup=keyboard(), parse_mode="HTML")
+    tg_send_message(
+        chat_id,
+        msg,
+        reply_markup=keyboard(),
+        parse_mode="HTML"
+    )
 
 
 def run_bot():
 
     offset = 0
 
-    print("Bot started")
+    print("Bot running")
 
     while True:
 
@@ -395,7 +410,6 @@ def run_bot():
                 if "message" in upd and "text" in upd["message"]:
 
                     chat_id = upd["message"]["chat"]["id"]
-
                     text = upd["message"]["text"]
 
                     if text == "/start":
@@ -406,9 +420,7 @@ def run_bot():
                     cq = upd["callback_query"]
 
                     cq_id = cq["id"]
-
                     chat_id = cq["message"]["chat"]["id"]
-
                     data_btn = cq.get("data")
 
                     if data_btn == BTN_GET:
