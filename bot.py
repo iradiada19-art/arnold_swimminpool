@@ -377,7 +377,7 @@ def build_message_html_all(files_payload):
         short_title = _short_file_title(title)
 
         parts.append("━━━━━━━━━━━━━━")
-        parts.append(f"🗓 <b>с {_escape_html(short_title)}</b>")
+        parts.append(f"🗓 <b>{_escape_html(short_title)}</b>")
         parts.append("━━━━━━━━━━━━━━")
         parts.append("")
 
