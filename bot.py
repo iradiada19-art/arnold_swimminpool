@@ -4,6 +4,7 @@ import json
 import time
 from io import BytesIO
 from urllib.parse import urljoin
+from datetime import datetime, timedelta
 
 import requests
 import pandas as pd
@@ -21,7 +22,7 @@ if not BOT_TOKEN:
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 BTN_GET = "get_free_swim"
-BTN_EVENING = "get_free_swim_evening"
+BTN_SUBSCRIBE = "subscribe_auto"
 
 DAYS = [
     "Понедельник",
@@ -33,9 +34,12 @@ DAYS = [
     "Воскресенье"
 ]
 
-EVENING_FROM_HOUR = 18
 MAX_XLS_FILES = 10
 MAX_MESSAGE_LEN = 3900
+
+SUBSCRIBERS_FILE = "subscribers.json"
+AUTO_SEND_HOUR = 10
+AUTO_SEND_MINUTE = 0
 # ------------------------------------------------
 
 
@@ -61,6 +65,83 @@ def _http_get(url: str, timeout: int = 30):
             last_error = e
             time.sleep(2)
     raise RuntimeError(f"Ошибка запроса: {last_error}")
+
+
+def _escape_html(text: str) -> str:
+    text = str(text or "")
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def _extract_date_range_from_title(title: str) -> str:
+    title = _norm(title)
+    m = re.search(
+        r"(\d{1,2}\.\d{1,2}\.\d{2,4})\s*[-–]\s*(\d{1,2}\.\d{1,2}\.\d{2,4})",
+        title
+    )
+    if m:
+        return f"{m.group(1)} – {m.group(2)}"
+
+    m = re.search(
+        r"(\d{1,2}\s+[А-Яа-яA-Za-z]+)\s*[-–]\s*(\d{1,2}\s+[А-Яа-яA-Za-z]+)",
+        title
+    )
+    if m:
+        return f"{m.group(1)} – {m.group(2)}"
+
+    m = re.search(
+        r"(\d{1,2}\.\d{1,2})\s*[-–]\s*(\d{1,2}\.\d{1,2})",
+        title
+    )
+    if m:
+        return f"{m.group(1)} – {m.group(2)}"
+
+    m = re.search(r"(\d{1,2}.*\d{1,2}.*)$", title)
+    if m:
+        return m.group(1)
+
+    return title.replace(LINK_TEXT_PREFIX, "").strip(" -–—")
+
+
+def load_subscribers():
+    if not os.path.exists(SUBSCRIBERS_FILE):
+        return []
+
+    try:
+        with open(SUBSCRIBERS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if not isinstance(data, list):
+            return []
+
+        cleaned = []
+        for x in data:
+            try:
+                cleaned.append(int(x))
+            except Exception:
+                pass
+
+        return sorted(list(set(cleaned)))
+    except Exception:
+        return []
+
+
+def save_subscribers(subscribers):
+    unique_ids = sorted(list(set(int(x) for x in subscribers)))
+    with open(SUBSCRIBERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(unique_ids, f, ensure_ascii=False, indent=2)
+
+
+def add_subscriber(chat_id):
+    subscribers = load_subscribers()
+    if int(chat_id) not in subscribers:
+        subscribers.append(int(chat_id))
+        save_subscribers(subscribers)
+        return True
+    return False
 
 
 def find_xls_links():
@@ -208,36 +289,22 @@ def parse_free_swim_from_xls(xls_bytes: bytes):
     return best
 
 
-def _start_hour_from_time_line(line):
-    m = re.search(r"\bс\s*(\d{1,2})[:.](\d{2})", line)
-    if not m:
-        return None
-    return int(m.group(1))
+def _short_file_title(title: str) -> str:
+    return _extract_date_range_from_title(title)
 
 
-def _filter_evening(times):
-    out = []
-    for t in times:
-        h = _start_hour_from_time_line(t)
-        if h is not None and h >= EVENING_FROM_HOUR:
-            out.append(t)
-    return out
-
-
-def build_message_html_all(files_payload, evening_only=False):
+def build_message_html_all(files_payload):
     parts = []
 
-    mode_title = (
-        "🌆 <b>Вечернее расписание</b>"
-        if evening_only
-        else "🏊 <b>Расписание свободного плавания</b>"
-    )
-    parts.append(mode_title)
+    parts.append("🏊 <b>Расписание свободного плавания</b>")
     parts.append("")
 
     for title, parsed in files_payload:
+        short_title = _short_file_title(title)
+
         parts.append("━━━━━━━━━━━━━━")
-        parts.append(f"📄 <b>{_norm(title)}</b>")
+        parts.append("📄 <b>Расписание бассейна</b>")
+        parts.append(f"🗓 <b>{_escape_html(short_title)}</b>")
         parts.append("━━━━━━━━━━━━━━")
         parts.append("")
 
@@ -251,12 +318,7 @@ def build_message_html_all(files_payload, evening_only=False):
             sanitary_time = payload.get("sanitary_time", [])
             sanitary_day = payload.get("sanitary_day", [])
 
-            if evening_only:
-                free_times = _filter_evening(free_times)
-                sanitary_time = _filter_evening(sanitary_time)
-                sanitary_day = _filter_evening(sanitary_day)
-
-            parts.append(f"📅 <b>{day_key}</b>")
+            parts.append(f"📅 <b>{_escape_html(day_key)}</b>")
 
             if not free_times and not sanitary_time and not sanitary_day:
                 parts.append("🧼 <b>Санитарный день</b>")
@@ -267,19 +329,19 @@ def build_message_html_all(files_payload, evening_only=False):
             parts.append("🏊 <b>Свободное плавание</b>")
             if free_times:
                 for t in free_times:
-                    parts.append(f"└ {t}")
+                    parts.append(f"└ {_escape_html(t)}")
             else:
                 parts.append("└ нет")
 
             if sanitary_time:
                 parts.append("🧽 <b>Санитарное время</b>")
                 for t in sanitary_time:
-                    parts.append(f"└ {t}")
+                    parts.append(f"└ {_escape_html(t)}")
 
             if sanitary_day:
                 parts.append("🚫 <b>Санитарный день</b>")
                 for t in sanitary_day:
-                    parts.append(f"└ {t}")
+                    parts.append(f"└ {_escape_html(t)}")
 
             parts.append("")
 
@@ -297,7 +359,7 @@ def keyboard():
     return {
         "inline_keyboard": [
             [{"text": "🏊 Получить расписание", "callback_data": BTN_GET}],
-            [{"text": "🌆 Только вечер", "callback_data": BTN_EVENING}]
+            [{"text": "🔔 Получать автоматически", "callback_data": BTN_SUBSCRIBE}]
         ]
     }
 
@@ -336,27 +398,11 @@ def get_updates(offset):
     return r.json()
 
 
-def handle_start(chat_id):
-    tg_send_message(
-        chat_id,
-        "Привет 🌿\n\nВыбери, какое расписание показать:",
-        reply_markup=keyboard()
-    )
-
-
-def handle_button(chat_id, callback_id, evening_only):
-    tg_answer_callback(callback_id, "⏳ Загружаю расписание...")
-
+def fetch_schedule_message():
     links = find_xls_links()
 
     if not links:
-        tg_send_message(
-            chat_id,
-            "⚠️ Не удалось найти файлы с расписанием.",
-            reply_markup=keyboard(),
-            parse_mode="HTML"
-        )
-        return
+        return "⚠️ Не удалось найти файлы с расписанием."
 
     files_payload = []
 
@@ -377,7 +423,22 @@ def handle_button(chat_id, callback_id, evening_only):
                 }
             ))
 
-    msg = build_message_html_all(files_payload, evening_only)
+    return build_message_html_all(files_payload)
+
+
+def handle_start(chat_id):
+    tg_send_message(
+        chat_id,
+        "Привет 🌿\n\nВыбери действие:",
+        reply_markup=keyboard()
+    )
+
+
+def handle_get_schedule(chat_id, callback_id=None):
+    if callback_id:
+        tg_answer_callback(callback_id, "⏳ Загружаю расписание...")
+
+    msg = fetch_schedule_message()
 
     tg_send_message(
         chat_id,
@@ -387,12 +448,81 @@ def handle_button(chat_id, callback_id, evening_only):
     )
 
 
+def handle_subscribe(chat_id, callback_id):
+    added = add_subscriber(chat_id)
+
+    if added:
+        tg_answer_callback(callback_id, "✅ Автоотправка включена")
+        text = (
+            "🔔 <b>Автоотправка включена</b>\n\n"
+            "Теперь я буду присылать новое расписание "
+            "каждый <b>понедельник в 10:00</b>."
+        )
+    else:
+        tg_answer_callback(callback_id, "ℹ️ Уже включено")
+        text = (
+            "ℹ️ <b>Автоотправка уже включена</b>\n\n"
+            "Ты уже подписана на получение расписания "
+            "каждый <b>понедельник в 10:00</b>."
+        )
+
+    tg_send_message(
+        chat_id,
+        text,
+        reply_markup=keyboard(),
+        parse_mode="HTML"
+    )
+
+
+def is_monday_10(now=None):
+    now = now or datetime.now()
+    return now.weekday() == 0 and now.hour == AUTO_SEND_HOUR and now.minute == AUTO_SEND_MINUTE
+
+
+def auto_send_if_needed(last_auto_send_key):
+    now = datetime.now()
+    current_key = now.strftime("%Y-%m-%d %H:%M")
+
+    if not is_monday_10(now):
+        return last_auto_send_key
+
+    if current_key == last_auto_send_key:
+        return last_auto_send_key
+
+    subscribers = load_subscribers()
+    if not subscribers:
+        return current_key
+
+    try:
+        msg = fetch_schedule_message()
+    except Exception as e:
+        msg = f"⚠️ Не удалось автоматически получить расписание.\n\nОшибка: {e}"
+
+    for chat_id in subscribers:
+        try:
+            tg_send_message(
+                chat_id,
+                msg,
+                reply_markup=keyboard(),
+                parse_mode="HTML"
+            )
+            time.sleep(0.4)
+        except Exception as e:
+            print(f"Auto send error for {chat_id}: {e}")
+
+    return current_key
+
+
 def run_bot():
     offset = 0
+    last_auto_send_key = ""
+
     print("Bot running")
 
     while True:
         try:
+            last_auto_send_key = auto_send_if_needed(last_auto_send_key)
+
             data = get_updates(offset)
 
             for upd in data.get("result", []):
@@ -412,9 +542,9 @@ def run_bot():
                     data_btn = cq.get("data")
 
                     if data_btn == BTN_GET:
-                        handle_button(chat_id, cq_id, False)
-                    elif data_btn == BTN_EVENING:
-                        handle_button(chat_id, cq_id, True)
+                        handle_get_schedule(chat_id, cq_id)
+                    elif data_btn == BTN_SUBSCRIBE:
+                        handle_subscribe(chat_id, cq_id)
                     else:
                         tg_answer_callback(cq_id)
 
