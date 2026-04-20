@@ -4,7 +4,8 @@ import json
 import time
 from io import BytesIO
 from urllib.parse import urljoin
-from datetime import datetime, date
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import requests
 import pandas as pd
@@ -46,7 +47,13 @@ AUTO_SEND_MINUTE = 0
 
 TEST_SEND_HOUR = 17
 TEST_SEND_MINUTE = 0
+
+MSK_TZ = ZoneInfo("Europe/Moscow")
 # ------------------------------------------------
+
+
+def now_msk():
+    return datetime.now(MSK_TZ)
 
 
 def _norm(s: str) -> str:
@@ -204,10 +211,10 @@ def _parse_day_month_year(text):
             if year < 100:
                 year += 2000
         else:
-            year = datetime.now().year
+            year = now_msk().year
 
         try:
-            return date(year, month, day)
+            return datetime(year, month, day, tzinfo=MSK_TZ).date()
         except Exception:
             return None
 
@@ -220,10 +227,10 @@ def _parse_day_month_year(text):
             return None
 
         year = m.group(3)
-        year = int(year) if year else datetime.now().year
+        year = int(year) if year else now_msk().year
 
         try:
-            return date(year, month, day)
+            return datetime(year, month, day, tzinfo=MSK_TZ).date()
         except Exception:
             return None
 
@@ -344,7 +351,7 @@ def parse_free_swim_from_xls(xls_bytes: bytes):
 
 
 def _filter_past_days(parsed):
-    today = date.today()
+    today = now_msk().date()
     filtered = {}
 
     for day_key, payload in parsed.items():
@@ -377,6 +384,7 @@ def build_message_html_all(files_payload):
         short_title = _short_file_title(title)
 
         parts.append("━━━━━━━━━━━━━━")
+        parts.append("📄 <b>Расписание бассейна</b>")
         parts.append(f"🗓 <b>{_escape_html(short_title)}</b>")
         parts.append("━━━━━━━━━━━━━━")
         parts.append("")
@@ -433,8 +441,8 @@ def keyboard():
     return {
         "inline_keyboard": [
             [{"text": "🏊 Получить расписание", "callback_data": BTN_GET}],
-            [{"text": "🔔 Получать автоматически в пн", "callback_data": BTN_SUBSCRIBE}],
-            [{"text": "🕔 Получать ежедневно в 17:00", "callback_data": BTN_DAILY_TEST}]
+            [{"text": "🔔 Получать автоматически", "callback_data": BTN_SUBSCRIBE}],
+            [{"text": "🕔 Тест: ежедневно в 17:00", "callback_data": BTN_DAILY_TEST}]
         ]
     }
 
@@ -531,14 +539,14 @@ def handle_subscribe_weekly(chat_id, callback_id):
         text = (
             "🔔 <b>Автоотправка включена</b>\n\n"
             "Теперь я буду присылать новое расписание "
-            "каждый <b>понедельник в 10:00</b>."
+            "каждый <b>понедельник в 10:00 по Москве</b>."
         )
     else:
         tg_answer_callback(callback_id, "ℹ️ Уже включено")
         text = (
             "ℹ️ <b>Автоотправка уже включена</b>\n\n"
             "Ты уже подписана на получение расписания "
-            "каждый <b>понедельник в 10:00</b>."
+            "каждый <b>понедельник в 10:00 по Москве</b>."
         )
 
     tg_send_message(
@@ -557,14 +565,14 @@ def handle_subscribe_daily_test(chat_id, callback_id):
         text = (
             "🕔 <b>Тестовая ежедневная отправка включена</b>\n\n"
             "Теперь я буду присылать расписание каждый день "
-            f"в <b>{TEST_SEND_HOUR:02d}:{TEST_SEND_MINUTE:02d}</b>."
+            f"в <b>{TEST_SEND_HOUR:02d}:{TEST_SEND_MINUTE:02d} по Москве</b>."
         )
     else:
         tg_answer_callback(callback_id, "ℹ️ Уже включено")
         text = (
             "ℹ️ <b>Тестовая ежедневная отправка уже включена</b>\n\n"
             "Ты уже подписана на ежедневную отправку "
-            f"в <b>{TEST_SEND_HOUR:02d}:{TEST_SEND_MINUTE:02d}</b>."
+            f"в <b>{TEST_SEND_HOUR:02d}:{TEST_SEND_MINUTE:02d} по Москве</b>."
         )
 
     tg_send_message(
@@ -576,17 +584,17 @@ def handle_subscribe_daily_test(chat_id, callback_id):
 
 
 def is_weekly_time(now=None):
-    now = now or datetime.now()
+    now = now or now_msk()
     return now.weekday() == 0 and now.hour == AUTO_SEND_HOUR and now.minute == AUTO_SEND_MINUTE
 
 
 def is_daily_test_time(now=None):
-    now = now or datetime.now()
+    now = now or now_msk()
     return now.hour == TEST_SEND_HOUR and now.minute == TEST_SEND_MINUTE
 
 
 def auto_send_weekly_if_needed(last_weekly_send_key):
-    now = datetime.now()
+    now = now_msk()
     current_key = now.strftime("%Y-%m-%d %H:%M")
 
     if not is_weekly_time(now):
@@ -620,7 +628,7 @@ def auto_send_weekly_if_needed(last_weekly_send_key):
 
 
 def auto_send_daily_test_if_needed(last_daily_send_key):
-    now = datetime.now()
+    now = now_msk()
     current_key = now.strftime("%Y-%m-%d %H:%M")
 
     if not is_daily_test_time(now):
@@ -659,6 +667,7 @@ def run_bot():
     last_daily_send_key = ""
 
     print("Bot running")
+    print("Timezone: Europe/Moscow")
 
     while True:
         try:
